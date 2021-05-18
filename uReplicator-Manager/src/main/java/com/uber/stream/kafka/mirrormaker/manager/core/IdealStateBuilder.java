@@ -118,7 +118,7 @@ public class IdealStateBuilder {
     for (String partitionName : oldIdealState.getPartitionSet()) {
       String instanceName = oldIdealState.getInstanceStateMap(partitionName).keySet().iterator().next();
       String instanceToUse = partitionName.equals(oldPartition) ? newInstanceName : instanceName;
-      String partitionToUse = partitionName.equals(oldPartition) ? newPartition : oldPartition;
+      String partitionToUse = partitionName.equals(oldPartition) ? newPartition : partitionName;
       customModeIdealStateBuilder.assignInstanceAndState(partitionToUse, instanceToUse, "ONLINE");
     }
 
@@ -126,7 +126,8 @@ public class IdealStateBuilder {
   }
 
   public static IdealState resetCustomIdealStateFor(IdealState oldIdealState,
-      String topicName, List<String> instanceToReplace, String availableInstance, int maxNumReplica) {
+      String topicName, List<String> instanceToReplace, List<String> availableInstances, int maxNumReplica) {
+
     final CustomModeISBuilder customModeIdealStateBuilder = new CustomModeISBuilder(topicName);
 
     int oldNumPartitions = oldIdealState.getNumPartitions();
@@ -137,11 +138,12 @@ public class IdealStateBuilder {
         .setMaxPartitionsPerNode(oldNumPartitions);
     for (String partitionName : oldIdealState.getPartitionSet()) {
       for (String instanceName : oldIdealState.getInstanceStateMap(partitionName).keySet()) {
-        String instanceToUse = instanceToReplace.contains(instanceName) ? availableInstance : instanceName;
+        String instanceToUse = instanceToReplace.contains(instanceName) ? availableInstances.get(0) : instanceName;
         customModeIdealStateBuilder.assignInstanceAndState(partitionName, instanceToUse, "ONLINE");
         if (instanceToReplace.contains(instanceName)) {
-          LOGGER.info("replaceing: route: {}@{}, old {}, new {}",
+          LOGGER.info("replacing: route: {}@{}, old {}, new {}",
               topicName, partitionName, instanceName, instanceToUse);
+          availableInstances.remove(0);
         }
       }
     }

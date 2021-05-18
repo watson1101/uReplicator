@@ -16,6 +16,7 @@
 package com.uber.stream.ureplicator.worker;
 
 import com.codahale.metrics.Meter;
+import com.google.common.annotations.VisibleForTesting;
 import com.uber.stream.ureplicator.common.KafkaUReplicatorMetricsReporter;
 import com.uber.stream.ureplicator.worker.interfaces.ICheckPointManager;
 import java.util.ArrayList;
@@ -25,7 +26,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import kafka.utils.ZKGroupTopicDirs;
 import kafka.utils.ZkUtils;
 import org.I0Itec.zkclient.ZkClient;
@@ -37,14 +40,13 @@ import org.slf4j.LoggerFactory;
 
 
 /**
- * CheckpointManager provides interface allows consumer/producer to access topic partition offset
- * checkpoint. To avoid data loss, commit should execute after producer flush succeed. Offset
- * checkpoint is currently stored on zookeeper.
+ * CheckpointManager provides interface allows consumer/producer to access topic partition offset checkpoint. To avoid
+ * data loss, commit should execute after producer flush succeed. Offset checkpoint is currently stored on zookeeper.
  */
 // TODO: deprecate zookeeper offset checkpoint
 public class ZookeeperCheckpointManager implements ICheckPointManager {
 
-  private final Executor commitExecutor;
+  private final ExecutorService commitExecutor;
 
   private static final Logger LOGGER = LoggerFactory.getLogger(ZookeeperCheckpointManager.class);
   private final Map<TopicPartition, Long> offsetCheckpoints = new ConcurrentHashMap();
@@ -54,18 +56,23 @@ public class ZookeeperCheckpointManager implements ICheckPointManager {
   private static final String COMMIT_FAILURE_METER_NAME = "commitFailure";
 
   public ZookeeperCheckpointManager(CustomizedConsumerConfig config, String groupId) {
-    this.commitZkClient = ZkUtils.createZkClient(
+    this(ZkUtils.createZkClient(
         config.getProperty(Constants.COMMIT_ZOOKEEPER_SERVER_CONFIG),
         config.getInt(ConsumerConfig.SESSION_TIMEOUT_MS_CONFIG, 10000),
-        config.getInt(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10000));
+        config.getInt(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10000)), groupId);
+  }
+
+  @VisibleForTesting
+  protected ZookeeperCheckpointManager(ZkClient commitZkClient, String groupId) {
+    this.commitZkClient = commitZkClient;
     this.groupId = groupId;
     this.commitExecutor = Executors.newFixedThreadPool(10);
     KafkaUReplicatorMetricsReporter.get().registerMetric(COMMIT_FAILURE_METER_NAME, commitFailure);
   }
 
-  public void commitOffset(Map<TopicPartition, Long> topicPartitionOffsets) {
+  public boolean commitOffset(Map<TopicPartition, Long> topicPartitionOffsets) {
     if (topicPartitionOffsets == null || topicPartitionOffsets.size() == 0) {
-      return;
+      return true;
     }
     LOGGER.trace("Committing offset to zookeepr for topics: {}", topicPartitionOffsets.keySet());
     List<CompletableFuture<Void>> futureList = new ArrayList<>();
@@ -80,11 +87,14 @@ public class ZookeeperCheckpointManager implements ICheckPointManager {
     } catch (InterruptedException e) {
       LOGGER.error("[{}]Caught InterruptedException on commitOffset.", e);
       commitFailure.mark(topicPartitionOffsets.size());
+      return false;
     } catch (ExecutionException e) {
       LOGGER.error("[{}]Caught ExecutionException on commitOffset.", e);
       commitFailure.mark(topicPartitionOffsets.size());
+      return false;
     }
     LOGGER.info("commitOffset finished, number of topics: {}", topicPartitionOffsets.size());
+    return true;
   }
 
   private void commitOffsetToZookeeper(TopicPartition topicPartition, long offset) {
@@ -123,5 +133,14 @@ public class ZookeeperCheckpointManager implements ICheckPointManager {
   public void shutdown() {
     commitZkClient.close();
     KafkaUReplicatorMetricsReporter.get().removeMetric(COMMIT_FAILURE_METER_NAME);
+    commitExecutor.shutdown();
+    try {
+      if (!commitExecutor.awaitTermination(1000, TimeUnit.MILLISECONDS)) {
+        LOGGER.error("Shutdown commitExecutor timeout");
+      }
+    } catch (InterruptedException e) {
+      LOGGER.error("Shutdown commitExecutor failed", e);
+    }
+    offsetCheckpoints.clear();
   }
 }

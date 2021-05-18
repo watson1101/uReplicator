@@ -83,7 +83,7 @@ public class ControllerHelixManager implements IHelixManager {
 
   private final WorkerHelixManager _workerHelixManager;
   private LiveInstanceChangeListener _liveInstanceChangeListener;
-  private Map<String, TopicWorkload> _pipelineWorkloadMap;
+  private ControllerWorkloadSnapshot _controllerWorkloadSnapshot;
 
   private final CloseableHttpClient _httpClient;
   private final RequestConfig _requestConfig;
@@ -134,7 +134,6 @@ public class ControllerHelixManager implements IHelixManager {
     _maxNumWorkersPerRoute = managerConf.getMaxNumWorkersPerRoute();
     _workloadRefreshPeriodInSeconds = managerConf.getWorkloadRefreshPeriodInSeconds();
     _workerHelixManager = new WorkerHelixManager(managerConf);
-    _pipelineWorkloadMap = new ConcurrentHashMap<>();
     _helixZkURL = HelixUtils.getAbsoluteZkPathForHelix(managerConf.getManagerZkStr());
     _helixClusterName = MANAGER_CONTROLLER_HELIX_PREFIX + "-" + managerConf.getManagerDeployment();
     _instanceId = managerConf.getManagerInstanceId();
@@ -159,6 +158,7 @@ public class ControllerHelixManager implements IHelixManager {
         .setConnectTimeout(30000)
         .setSocketTimeout(30000)
         .build();
+    _controllerWorkloadSnapshot = new ControllerWorkloadSnapshot(_httpClient, _requestConfig);
   }
 
   public synchronized void start() {
@@ -572,7 +572,7 @@ public class ControllerHelixManager implements IHelixManager {
           String topicName = tp.getTopic();
           if (topicName.startsWith(SEPARATOR)) {
             currPipelineToInstanceMap.putIfAbsent(topicName, new PriorityQueue<>(1,
-                InstanceTopicPartitionHolder.totalWorkloadComparator(_pipelineWorkloadMap)));
+                InstanceTopicPartitionHolder.totalWorkloadComparator(_controllerWorkloadSnapshot.getPipelineWorkloadMap())));
             InstanceTopicPartitionHolder itph = new InstanceTopicPartitionHolder(instanceId, tp);
             if (workerRouteToInstanceMap.get(tp) != null) {
               itph.addWorkers(workerRouteToInstanceMap.get(tp));
@@ -597,6 +597,16 @@ public class ControllerHelixManager implements IHelixManager {
           }
         }
       }
+      Map<String, HostAndPort> pipelineHostInfoMap = new HashMap<>();
+      for (InstanceTopicPartitionHolder holder : instanceMap.values()) {
+        try {
+          pipelineHostInfoMap.put(holder.getRouteString(), getHostInfo(holder.getInstanceName()));
+        } catch (Exception e) {
+          LOGGER.warn("Failed to find hostInfo for instanceId {}", holder.getInstanceName());
+        }
+      }
+      _controllerWorkloadSnapshot.updatePipelineHostInfoMap(pipelineHostInfoMap);
+      _controllerWorkloadSnapshot.refreshWorkloadInfo();
 
       _pipelineToInstanceMap = currPipelineToInstanceMap;
       _topicToPipelineInstanceMap = currTopicToPipelineInstanceMap;
@@ -662,7 +672,6 @@ public class ControllerHelixManager implements IHelixManager {
         LOGGER.warn("Failed to curl topic info from controller: {}", itph.getInstanceName(), e);
       }
     }
-
     return resultJson;
   }
 
@@ -692,16 +701,6 @@ public class ControllerHelixManager implements IHelixManager {
       }
     }
     return false;
-  }
-
-  public List<String> getPipelineLists() {
-    List<String> pipelineList = new ArrayList<>();
-    for (String resource : _helixAdmin.getResourcesInCluster(_helixClusterName)) {
-      if (resource.startsWith(SEPARATOR)) {
-        pipelineList.add(resource);
-      }
-    }
-    return pipelineList;
   }
 
   public List<String> getTopicLists() {
@@ -917,7 +916,6 @@ public class ControllerHelixManager implements IHelixManager {
       if (!routeControllerDown && !routeWorkerDown) {
         updateCurrentStatus();
       }
-
       if (isAutoScalingEnabled()) {
         scaleCurrentCluster();
       } else {
@@ -957,7 +955,7 @@ public class ControllerHelixManager implements IHelixManager {
     for (String pipeline : _pipelineToInstanceMap.keySet()) {
       LOGGER.info("Start rescale pipeline: {}", pipeline);
       PriorityQueue<InstanceTopicPartitionHolder> newItphQueue = new PriorityQueue<>(1,
-          InstanceTopicPartitionHolder.totalWorkloadComparator(_pipelineWorkloadMap));
+          InstanceTopicPartitionHolder.totalWorkloadComparator(_controllerWorkloadSnapshot.getPipelineWorkloadMap()));
       // TODO: what if routeId is not continuous
       int nextRouteId = _pipelineToInstanceMap.get(pipeline).size();
       for (InstanceTopicPartitionHolder itph : _pipelineToInstanceMap.get(pipeline)) {
@@ -1034,15 +1032,18 @@ public class ControllerHelixManager implements IHelixManager {
         }
 
         try {
-          HostAndPort hostInfo = getHostInfo(itph.getInstanceName());
-          String result = HttpClientUtils.getData(_httpClient, _requestConfig,
-              hostInfo.getHost(), hostInfo.getPort(), "/admin/workloadinfo");
-          ControllerWorkloadInfo workloadInfo = JSONObject
-              .parseObject(result, ControllerWorkloadInfo.class);
-          TopicWorkload totalWorkload = workloadInfo.getTopicWorkload();
+          boolean isFailed = _controllerWorkloadSnapshot.getFailedPipelines().contains(itph.getRouteString());
+          if (isFailed) {
+            LOGGER.error(String.format("Get workload error on route %s. No change on number of workers", itph.getInstanceName(), itph.getRouteString()));
+            continue;
+          }
+          ControllerWorkloadInfo workloadInfo = _controllerWorkloadSnapshot.getPipelineWorkloadMap().get(itph.getRouteString());
 
+          if (workloadInfo == null || !workloadInfo.isAutoBalancingEnabled()) {
+            LOGGER.warn("Skip scaling worker for route {} because of auto balancing is disabled on controller", routeString);
+            continue;
+          }
           if (workloadInfo != null && workloadInfo.getNumOfExpectedWorkers() != 0) {
-            _pipelineWorkloadMap.put(itph.getRouteString(), totalWorkload);
             int expectedNumWorkers = workloadInfo.getNumOfExpectedWorkers();
             LOGGER.info("Current {} workers in route {}, expect {} workers",
                 itph.getWorkerSet().size(), itph.getRouteString(), expectedNumWorkers);
@@ -1073,8 +1074,8 @@ public class ControllerHelixManager implements IHelixManager {
             newTotalNumWorker += actualExpectedNumWorkers;
           } else {
             LOGGER
-                .warn("Get workload on {} for route: {} returns 0. No change on number of workers",
-                    hostInfo, itph.getRouteString());
+                .warn("Get workload route: {} returns 0. No change on number of workers",
+                    itph.getRouteString());
             newTotalNumWorker += itph.getWorkerSet().size();
             rescaleFailedCount++;
           }
@@ -1106,15 +1107,7 @@ public class ControllerHelixManager implements IHelixManager {
             * _numOfWorkersBatchSize) + initWorkerPerRoute;
   }
 
-  public int getExpectedNumWorkers(int currNumPartitions) {
-    return Math.min(_maxNumWorkersPerRoute, _initMaxNumWorkersPerRoute +
-        (_maxNumWorkersPerRoute - _initMaxNumWorkersPerRoute) *
-            (currNumPartitions - _initMaxNumPartitionsPerRoute) /
-            (_maxNumPartitionsPerRoute - _initMaxNumPartitionsPerRoute));
-  }
-
-  public InstanceTopicPartitionHolder createNewRoute(String pipeline, int routeId)
-      throws Exception {
+  public InstanceTopicPartitionHolder createNewRoute(String pipeline, int routeId) throws Exception {
     if (_availableControllerList.isEmpty()) {
       LOGGER.info("No available controller!");
       throw new Exception("No available controller!");
@@ -1170,8 +1163,8 @@ public class ControllerHelixManager implements IHelixManager {
     }
 
     _availableControllerList.remove(instanceName);
-    _pipelineToInstanceMap.putIfAbsent(pipeline, new PriorityQueue<>(1,
-        InstanceTopicPartitionHolder.totalWorkloadComparator(_pipelineWorkloadMap)));
+    _pipelineToInstanceMap.put(pipeline, new PriorityQueue<>(1,
+        InstanceTopicPartitionHolder.totalWorkloadComparator(_controllerWorkloadSnapshot.getPipelineWorkloadMap())));
     _pipelineToInstanceMap.get(pipeline).add(instance);
     _assignedControllerCount.inc();
     _workerHelixManager.addTopicToMirrorMaker(instance, pipeline, routeId);
@@ -1400,10 +1393,6 @@ public class ControllerHelixManager implements IHelixManager {
         .forResource(topicName).build(), new HashMap<>());
   }
 
-  public KafkaClusterValidationManager getKafkaValidationManager() {
-    return _kafkaValidationManager;
-  }
-
   public WorkerHelixManager getWorkerHelixManager() {
     return _workerHelixManager;
   }
@@ -1414,11 +1403,6 @@ public class ControllerHelixManager implements IHelixManager {
 
   private static String getPipelineFromRoute(String route) {
     return route.substring(0, route.lastIndexOf("@"));
-  }
-
-  private static String getSrc(String pipeline) {
-    String[] srcDst = pipeline.split(SEPARATOR);
-    return srcDst[1];
   }
 
   public void disableAutoScaling() {
